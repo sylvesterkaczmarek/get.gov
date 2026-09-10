@@ -1,0 +1,68 @@
+name: Validate domain response ordering
+on:
+  push:
+    branches: [validation/domain-availability-response-order]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare a clean fix branch
+        run: |
+          cp tests/domain-availability-race.test.cjs "$RUNNER_TEMP/domain-availability-race.test.cjs"
+          git switch -c fix/domain-availability-response-order 92c6896e315090cafdee4b50558101b77824226a
+          mkdir -p tests
+          cp "$RUNNER_TEMP/domain-availability-race.test.cjs" tests/domain-availability-race.test.cjs
+      - name: Reproduce the original race
+        shell: bash
+        run: |
+          set +e
+          node --test tests/domain-availability-race.test.cjs > "$RUNNER_TEMP/before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/before.log"
+          test "$result" -eq 1
+          grep -q '# fail 6' "$RUNNER_TEMP/before.log"
+      - name: Apply the response-order fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('_includes/meta.html')
+          source = path.read_text()
+          replacements = [
+              ('    function checkDomainAvailability(',
+               '    const domainAvailabilityRequests = new Map();\n\n    function checkDomainAvailability('),
+              ('      event.preventDefault();\n',
+               '      event.preventDefault();\n\n      // Supersede earlier lookups for this result, including empty submissions.\n      const requestToken = Symbol();\n      domainAvailabilityRequests.set(alertId, requestToken);\n'),
+              ('      }).then(function(response) {\n',
+               '      }).then(function(response) {\n          if (domainAvailabilityRequests.get(alertId) !== requestToken) {\n              return;\n          }\n\n'),
+          ]
+          for old, new in replacements:
+              assert source.count(old) == 1, old
+              source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
+      - name: Run regression tests
+        run: node --test tests/domain-availability-race.test.cjs
+      - name: Build production site
+        run: |
+          npm ci
+          ELEVENTY_ENV=production npm run build
+      - name: Publish only the tested fix and regression tests
+        run: |
+          git diff --check
+          git add _includes/meta.html tests/domain-availability-race.test.cjs
+          git diff --cached --stat
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git commit -m 'Ignore superseded domain-availability responses'
+          git push origin HEAD:refs/heads/fix/domain-availability-response-order
+          git log -1 --format='%H %s'
